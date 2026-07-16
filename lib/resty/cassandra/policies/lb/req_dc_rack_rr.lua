@@ -14,9 +14,6 @@
 local cluster = require "resty.cassandra.cluster"
 local _M = require('resty.cassandra.policies.lb').new_policy('req_dc_rack_aware_round_robin')
 
-local log = ngx.log
-local WARN = ngx.WARN
-local _log_prefix = cluster._log_prefix
 local past_init
 
 --- Create a request, DC and rack-aware round robin policy.
@@ -75,17 +72,6 @@ function _M:init(peers)
   self.same_rack_peers = same_rack
   self.local_other_rack_peers = local_other_rack
   self.remote_peers = remote
-
-  local function hosts_str(t)
-    local buf = {}
-    for i = 1, #t do buf[i] = t[i].host end
-    return table.concat(buf, ",")
-  end
-  log(WARN, _log_prefix, "req_dc_rack_rr init: dc=", self.local_dc,
-      " rack=", self.local_rack or "(nil)",
-      " | same_rack=[", hosts_str(same_rack),
-      "] local_other=[", hosts_str(local_other_rack),
-      "] remote=[", hosts_str(remote), "]")
 end
 
 local function advance_peer(state)
@@ -96,8 +82,6 @@ local function advance_peer(state)
     if state.ctx then
       state.ctx.cassandra_coordinator = peer
     end
-    log(WARN, _log_prefix, "req_dc_rack_rr: chose ", peer.host,
-        " (tier=same_rack, rack=", peer.rack or "?", ")")
     return peer
 
   elseif state.local_other_tried < #state.local_other_rack_peers then
@@ -107,17 +91,12 @@ local function advance_peer(state)
     if state.ctx then
       state.ctx.cassandra_coordinator = peer
     end
-    log(WARN, _log_prefix, "req_dc_rack_rr: chose ", peer.host,
-        " (tier=local_other_rack, rack=", peer.rack or "?", ")")
     return peer
 
   elseif state.remote_tried < #state.remote_peers then
     state.remote_tried = state.remote_tried + 1
     state.remote_idx = state.remote_idx + 1
-    local peer = state.remote_peers[(state.remote_idx % #state.remote_peers) + 1]
-    log(WARN, _log_prefix, "req_dc_rack_rr: chose ", peer.host,
-        " (tier=remote, dc=", peer.data_center or "?", ")")
-    return peer
+    return state.remote_peers[(state.remote_idx % #state.remote_peers) + 1]
   end
 end
 
@@ -125,8 +104,6 @@ local function next_peer(state, i)
   i = i + 1
 
   if i == 1 and state.initial_cassandra_coordinator then
-    log(WARN, _log_prefix, "req_dc_rack_rr: reusing sticky coordinator ",
-        state.initial_cassandra_coordinator.host)
     return i, state.initial_cassandra_coordinator
   end
 
