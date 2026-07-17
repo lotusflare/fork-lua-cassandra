@@ -900,7 +900,7 @@ Notes:
       [cql_types.blob]    = marsh_raw,
       [cql_types.boolean] = marsh_boolean,
       [cql_types.counter] = marsh_bigint,
-      [cql_types.decimal]    = marsh_decimal,
+      -- decimal (0x06) not yet implemented
       [cql_types.double]    = marsh_double,
       [cql_types.float]     = marsh_float,
       [cql_types.inet]      = marsh_inet,
@@ -976,7 +976,7 @@ Notes:
       [cql_types.blob]      = unmarsh_raw,
       [cql_types.boolean]   = unmarsh_boolean,
       [cql_types.counter]   = unmarsh_bigint,
-      [cql_types.decimal]    = unmarsh_decimal,
+      -- decimal (0x06) not yet implemented
       [cql_types.double]    = unmarsh_double,
       [cql_types.float]     = unmarsh_float,
       [cql_types.inet]      = unmarsh_inet,
