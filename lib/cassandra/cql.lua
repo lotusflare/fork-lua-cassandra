@@ -900,7 +900,7 @@ Notes:
       [cql_types.blob]    = marsh_raw,
       [cql_types.boolean] = marsh_boolean,
       [cql_types.counter] = marsh_bigint,
-      -- decimal (0x06) not yet implemented
+      -- decimal 0x06
       [cql_types.double]    = marsh_double,
       [cql_types.float]     = marsh_float,
       [cql_types.inet]      = marsh_inet,
@@ -976,7 +976,7 @@ Notes:
       [cql_types.blob]      = unmarsh_raw,
       [cql_types.boolean]   = unmarsh_boolean,
       [cql_types.counter]   = unmarsh_bigint,
-      -- decimal (0x06) not yet implemented
+      -- decimal 0x06
       [cql_types.double]    = unmarsh_double,
       [cql_types.float]     = unmarsh_float,
       [cql_types.inet]      = unmarsh_inet,
@@ -1098,7 +1098,8 @@ Notes:
         local total_payload_length = #payload
         local fragments = {}
         local offset = 1
-        
+        local is_first_fragment = true
+
         while total_payload_length > 0 do
           local fragment_payload_length = math.min(total_payload_length, max_payload_length)
           local fragment_payload = payload:sub(offset, offset + fragment_payload_length - 1)
@@ -1109,12 +1110,15 @@ Notes:
         
           -- Set is_self_contained flag
           local is_self_contained
-          if total_payload_length == 0 then
-            -- This is the last fragment
-            is_self_contained = 1
+          if is_first_fragment then
+              if total_payload_length > 0 then
+                  is_self_contained = 0
+              else
+                  is_self_contained = 1
+              end
+              is_first_fragment = false
           else
-            -- More fragments will follow
-            is_self_contained = 0
+              is_self_contained = 0
           end
         
           -- Build the Frame Header
@@ -1674,7 +1678,7 @@ Notes:
     consistencies        = consistencies,
     min_protocol_version = 2,
     -- Controls whether to use v4 or v5 protocol for communication
-    def_protocol_version = 4,
+    def_protocol_version = 5,
     OP_CODES = OP_CODES,
   
     -- Expose crc24 and crc32 functions

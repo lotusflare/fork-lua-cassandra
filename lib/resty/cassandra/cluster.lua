@@ -24,6 +24,7 @@ local now = ngx.now
 local type = type
 local log = ngx.log
 local ERR = ngx.ERR
+local DEBUG = ngx.DEBUG
 
 local empty_t = {}
 local _log_prefix = '[lua-cassandra] '
@@ -536,7 +537,7 @@ local function next_coordinator(self, coordinator_options)
       local peer, err = check_peer_health(self, peer_rec.host, coordinator_options, retry)
       if peer then
         if self.logging then
-          log(ERR, _log_prefix, 'load balancing policy chose host at ',  peer.host)
+          log(DEBUG, _log_prefix, 'load balancing policy chose host at ',  peer.host)
         end
         return peer
       else
@@ -1093,7 +1094,7 @@ do
     local coordinator, err = next_coordinator(self, coordinator_options)
     if not coordinator then return nil, err end
 
-    log(ERR, _log_prefix, 'coordinator: protocol_version (protocol_version=', coordinator.protocol_version, ')')
+    log(DEBUG, _log_prefix, 'coordinator: protocol_version (protocol_version=', coordinator.protocol_version, ')')
 
     local request
     local opts = get_request_opts(options)
