@@ -1387,3 +1387,169 @@ GET /t
 system
 --- no_error_log
 [error]
+
+
+
+=== TEST 30: next_coordinator_with_refresh() returns coordinator without refreshing when one is available
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Cluster = require 'resty.cassandra.cluster'
+            local cluster, err = Cluster.new()
+            if not cluster then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local ok, err = cluster:refresh()
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local topo_ver_before = cluster.topo_ver
+
+            local coordinator, err = cluster:next_coordinator_with_refresh()
+            if not coordinator then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            ngx.say('coordinator: ', coordinator.host)
+            -- healthy path must not trigger a topology refresh
+            ngx.say('topo_ver unchanged: ', cluster.topo_ver == topo_ver_before)
+        }
+    }
+--- request
+GET /t
+--- response_body_like
+coordinator: 127\.0\.0\.\d+
+topo_ver unchanged: true
+--- no_error_log
+[error]
+
+
+
+=== TEST 31: next_coordinator_with_refresh() recovers when all peers are down by refreshing from contact_points
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Cluster = require 'resty.cassandra.cluster'
+            local cluster, err = Cluster.new {
+                timeout_connect = 100
+            }
+            if not cluster then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            -- populate a real topology (127.0.0.1-3) from the live contact points
+            local ok, err = cluster:refresh()
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            -- simulate every stored address having gone away: point the in-memory
+            -- load balancing policy at unreachable hosts, leaving the real
+            -- contact_points untouched. next_coordinator() will find all down.
+            local ok, err = cluster:set_peer_up('255.255.255.254')
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local ok, err = cluster:set_peers(cluster.topo_ver, {
+                { host = '255.255.255.254' },
+            })
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local fake_peers, err = cluster:get_peers(cluster.topo_ver)
+            if not fake_peers then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+            cluster.lb_policy:init(fake_peers)
+
+            -- with only an unreachable peer known, recovery must re-resolve the
+            -- contact points and return a real coordinator
+            local coordinator, err = cluster:next_coordinator_with_refresh()
+            if not coordinator then
+                ngx.log(ngx.ERR, 'expected recovery, got: ', err)
+                return
+            end
+
+            ngx.say('recovered coordinator: ', coordinator.host)
+        }
+    }
+--- request
+GET /t
+--- response_body_like
+recovered coordinator: 127\.0\.0\.\d+
+--- no_error_log
+[error]
+
+
+
+=== TEST 32: next_coordinator_with_refresh() surfaces combined error when refresh also fails
+--- http_config eval
+qq {
+    lua_socket_log_errors off;
+    $::HttpConfig
+}
+--- config
+    location /t {
+        content_by_lua_block {
+            local Cluster = require 'resty.cassandra.cluster'
+            local cluster, err = Cluster.new {
+                contact_points = { '255.255.255.254' },
+                timeout_connect = 100
+            }
+            if not cluster then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            -- known topology consists only of an unreachable host, and the
+            -- contact points are unreachable too, so recovery cannot succeed
+            local ok, err = cluster:set_peer_up('255.255.255.253')
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local ok, err = cluster:set_peers(1, {
+                { host = '255.255.255.253' },
+            })
+            if not ok then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local peers, err = cluster:get_peers(1)
+            if not peers then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+            cluster.lb_policy:init(peers)
+
+            local coordinator, err = cluster:next_coordinator_with_refresh()
+            if coordinator then
+                ngx.log(ngx.ERR, 'expected failure, got coordinator ', coordinator.host)
+                return
+            end
+
+            ngx.say(err)
+        }
+    }
+--- request
+GET /t
+--- response_body_like chomp
+all hosts tried for query failed\..*\(topology refresh failed: .*255\.255\.255\.254.*\)
+--- no_error_log
+[error]

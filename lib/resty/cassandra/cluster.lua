@@ -544,7 +544,10 @@ local function next_coordinator(self, coordinator_options)
         errors[peer_rec.host] = err
       end
     elseif err then
-      return nil, err
+      -- This is an internal state error, not evidence that the topology is
+      -- stale. Let callers distinguish it from an exhausted host list so they
+      -- do not hide it behind an unrelated refresh attempt.
+      return nil, err, false
     else
       local s = 'host still considered down'
       if peer_state then
@@ -562,7 +565,43 @@ local function next_coordinator(self, coordinator_options)
     end
   end
 
-  return nil, no_host_available_error(errors)
+  return nil, no_host_available_error(errors), true
+end
+
+-- When every known peer is down, the topology stored in the shm only holds
+-- stale addresses (e.g. IPs of nodes that have since been replaced). The only
+-- way back to a healthy cluster is to re-resolve the configured
+-- `contact_points` (which may be DNS names) and rebuild the topology from them.
+-- `next_coordinator` on its own never does this, so a cluster whose nodes all
+-- changed address would stay permanently unreachable. This wrapper detects the
+-- all-down case, forces a topology refresh from the contact points, and retries
+-- the coordinator selection once.
+local function next_coordinator_with_refresh(self, coordinator_options)
+  local coordinator, err, refreshable = next_coordinator(self, coordinator_options)
+  if coordinator then
+    return coordinator
+  end
+
+  if not refreshable then
+    return nil, err
+  end
+
+  if self.logging then
+    log(ERR, _log_prefix, 'no coordinator available (', err, '), refreshing ',
+                          'topology from contact points')
+  end
+
+  -- Refresh re-resolves the contact points and rebuilds the topology. When
+  -- this worker still holds the latest topo version, refresh re-runs
+  -- first_coordinator (resolving the possibly-DNS contact points afresh); when
+  -- another worker already rebuilt it, refresh just adopts the newer topology.
+  local ok, refresh_err = self:refresh()
+  if not ok then
+    -- keep the original all-down error, but surface why recovery failed too
+    return nil, err .. ' (topology refresh failed: ' .. refresh_err .. ')'
+  end
+
+  return next_coordinator(self, coordinator_options)
 end
 
 local function compare_peers(t1, t2, tc)
@@ -921,7 +960,7 @@ end
 local send_request
 
 function _Cluster:send_retry(request, ...)
-  local coordinator, err = next_coordinator(self)
+  local coordinator, err = next_coordinator_with_refresh(self)
   if not coordinator then return nil, err end
 
   if self.logging then
@@ -1091,7 +1130,7 @@ do
 
     coordinator_options = coordinator_options or empty_t
 
-    local coordinator, err = next_coordinator(self, coordinator_options)
+    local coordinator, err = next_coordinator_with_refresh(self, coordinator_options)
     if not coordinator then return nil, err end
 
     log(DEBUG, _log_prefix, 'coordinator: protocol_version (protocol_version=', coordinator.protocol_version, ')')
@@ -1148,7 +1187,7 @@ do
 
     coordinator_options = coordinator_options or empty_t
 
-    local coordinator, err = next_coordinator(self, coordinator_options)
+    local coordinator, err = next_coordinator_with_refresh(self, coordinator_options)
     if not coordinator then return nil, err end
 
     local opts = get_request_opts(options)
@@ -1206,6 +1245,7 @@ _Cluster.handle_error = handle_error
 _Cluster.set_peer_down = set_peer_down
 _Cluster.get_or_prepare = get_or_prepare
 _Cluster.next_coordinator = next_coordinator
+_Cluster.next_coordinator_with_refresh = next_coordinator_with_refresh
 _Cluster.first_coordinator = first_coordinator
 _Cluster.wait_schema_consensus = wait_schema_consensus
 _Cluster.check_schema_consensus = check_schema_consensus
