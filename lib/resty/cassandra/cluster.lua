@@ -521,7 +521,7 @@ local function next_coordinator(self, coordinator_options)
       -- This is an internal state error, not evidence that the topology is
       -- stale. Let callers distinguish it from an exhausted host list so they
       -- do not hide it behind an unrelated refresh attempt.
-      return nil, err, false
+      return nil, err
     else
       local s = 'host still considered down'
       if peer_state then
