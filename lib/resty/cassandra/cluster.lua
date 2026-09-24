@@ -25,6 +25,7 @@ local type = type
 local log = ngx.log
 local ERR = ngx.ERR
 local pcall = pcall
+local DEBUG = ngx.DEBUG
 
 local empty_t = {}
 local _log_prefix = '[lua-cassandra] '
@@ -44,10 +45,16 @@ end
 -----------------------------------------
 
 local function set_peer(self, host, up, reconn_delay, unhealthy_at,
-                        data_center, connect_err, release_version, add)
+                        data_center, connect_err, release_version, rack, add)
+  if type(rack) == 'boolean' then
+    add = rack
+    rack = ''
+  end
+
   data_center = data_center or ''
   connect_err = connect_err or ''
   release_version = release_version or ''
+  rack = rack or ''
 
   local method = add and 'safe_add' or 'safe_set'
 
@@ -58,9 +65,9 @@ local function set_peer(self, host, up, reconn_delay, unhealthy_at,
   end
 
   -- host info
-  local marshalled = fmt("%d:%d:%d:%d:%s%s%s", reconn_delay, unhealthy_at,
-                         #data_center, #connect_err, data_center, connect_err,
-                         release_version)
+  local marshalled = fmt("%d:%d:%d:%d:%d:%s%s%s%s", reconn_delay, unhealthy_at,
+                         #data_center, #connect_err, #rack,
+                         data_center, connect_err, rack, release_version)
 
   ok, err = self.shm[method](self.shm, _rec_key..host, marshalled)
   if not ok and err ~= "exists" then
@@ -71,9 +78,9 @@ local function set_peer(self, host, up, reconn_delay, unhealthy_at,
 end
 
 local function add_peer(self, host, up, reconn_delay, unhealthy_at,
-                        data_center, connect_err, release_version)
+                        data_center, connect_err, release_version, rack)
   return set_peer(self, host, up, reconn_delay, unhealthy_at, data_center, nil,
-                  release_version, true)
+                  release_version, rack, true)
 end
 
 local function get_peer(self, host, status)
@@ -107,23 +114,42 @@ local function get_peer(self, host, status)
   local sep_2 = find(marshalled, ":", sep_1 + 1, true)
   local sep_3 = find(marshalled, ":", sep_2 + 1, true)
   local sep_4 = find(marshalled, ":", sep_3 + 1, true)
+  local sep_5 = find(marshalled, ":", sep_4 + 1, true)
 
   local reconn_delay    = sub(marshalled, 1, sep_1 - 1)
   local unhealthy_at    = sub(marshalled, sep_1 + 1, sep_2 - 1)
   local data_center_len = sub(marshalled, sep_2 + 1, sep_3 - 1)
   local err_len         = sub(marshalled, sep_3 + 1, sep_4 - 1)
 
-  local data_center_last = sep_4 + tonumber(data_center_len)
-  local err_last = data_center_last + tonumber(err_len)
+  local data_center, err_conn, rack, release_version
 
-  local data_center     = sub(marshalled, sep_4 + 1, data_center_last)
-  local err_conn        = sub(marshalled, data_center_last + 1, err_last)
-  local release_version = sub(marshalled, err_last + 1)
+  if sep_5 and tonumber(sub(marshalled, sep_4 + 1, sep_5 - 1)) then
+    -- new format: reconn:unhealthy:dc_len:err_len:rack_len:dc+err+rack+ver
+    local rack_len = tonumber(sub(marshalled, sep_4 + 1, sep_5 - 1))
+    local data_center_last = sep_5 + tonumber(data_center_len)
+    local err_last = data_center_last + tonumber(err_len)
+    local rack_last = err_last + rack_len
+
+    data_center     = sub(marshalled, sep_5 + 1, data_center_last)
+    err_conn        = sub(marshalled, data_center_last + 1, err_last)
+    rack            = sub(marshalled, err_last + 1, rack_last)
+    release_version = sub(marshalled, rack_last + 1)
+  else
+    -- old format: reconn:unhealthy:dc_len:err_len:dc+err+ver
+    local data_center_last = sep_4 + tonumber(data_center_len)
+    local err_last = data_center_last + tonumber(err_len)
+
+    data_center     = sub(marshalled, sep_4 + 1, data_center_last)
+    err_conn        = sub(marshalled, data_center_last + 1, err_last)
+    rack            = nil
+    release_version = sub(marshalled, err_last + 1)
+  end
 
   return {
     up = status,
     host = host,
     data_center = data_center ~= '' and data_center or nil,
+    rack = rack ~= '' and rack or nil,
     release_version = release_version ~= '' and release_version or nil,
     reconn_delay = tonumber(reconn_delay),
     unhealthy_at = tonumber(unhealthy_at),
@@ -231,7 +257,7 @@ local function set_peer_down(self, host, connect_err)
   peer = peer or empty_t -- this can be called from refresh() so no host in shm yet
 
   local ok, err = set_peer(self, host, false, self.reconn_policy:next_delay(host), get_now(),
-                           peer.data_center, connect_err, peer.release_version)
+                           peer.data_center, connect_err, peer.release_version, peer.rack)
   if ok and connect_err then schedule_refresh(self) end
   return ok, err
 end
@@ -246,7 +272,7 @@ local function set_peer_up(self, host)
   peer = peer or empty_t -- this can be called from refresh() so no host in shm yet
 
   return set_peer(self, host, true, 0, 0,
-                  peer.data_center, nil, peer.release_version)
+                  peer.data_center, nil, peer.release_version, peer.rack)
 end
 
 local  function set_peer_maintenance(self, host, maintenance)
@@ -560,7 +586,7 @@ local function next_coordinator(self, coordinator_options, tried_hosts, failed_h
         if peer then
           if failed_hosts then failed_hosts[peer_rec.host] = nil end
           if self.logging then
-            log(ERR, _log_prefix, 'load balancing policy chose host at ',  peer.host)
+            log(DEBUG, _log_prefix, 'load balancing policy chose host at ',  peer.host)
           end
           return peer
         else
@@ -734,7 +760,7 @@ function _Cluster:refresh(timeout)
       coordinator:settimeout(self.timeout_read)
 
       local local_rows, err = coordinator:execute [[
-        SELECT data_center,rpc_address,release_version FROM system.local
+        SELECT data_center,rack,rpc_address,release_version FROM system.local
       ]]
       if not local_rows then
         return err_with_unlock(lock, err)
@@ -745,7 +771,7 @@ function _Cluster:refresh(timeout)
       end
 
       local rows, err = coordinator:execute [[
-        SELECT peer,data_center,rpc_address,release_version FROM system.peers
+        SELECT peer,data_center,rack,rpc_address,release_version FROM system.peers
       ]]
       if not rows then
         return err_with_unlock(lock, err)
@@ -769,6 +795,7 @@ function _Cluster:refresh(timeout)
       rows[#rows+1] = { -- local host
         rpc_address = local_addr,
         data_center = local_rows[1].data_center,
+        rack = local_rows[1].rack,
         release_version = local_rows[1].release_version
       }
 
@@ -828,9 +855,9 @@ function _Cluster:refresh(timeout)
                                   ' in ', coordinator.host, '\'s peers system ',
                                   'table. ', rows[i].peer, ' will be ignored.')
           else
-            local ok, err = add_peer(self, rows[i].host, true, 0, 0,
+            local ok, err = set_peer(self, rows[i].host, true, 0, 0,
                                      rows[i].data_center, nil,
-                                     rows[i].release_version)
+                                     rows[i].release_version, rows[i].rack)
             if not ok then return err_with_unlock(lock, err) end
           end
         end
@@ -1231,7 +1258,7 @@ do
     local coordinator, err = next_coordinator_with_refresh(self, coordinator_options, request)
     if not coordinator then return nil, err end
 
-    log(ERR, _log_prefix, 'coordinator: protocol_version (protocol_version=', coordinator.protocol_version, ')')
+    log(DEBUG, _log_prefix, 'coordinator: protocol_version (protocol_version=', coordinator.protocol_version, ')')
 
     return send_request(self, coordinator, request)
   end

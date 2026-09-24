@@ -95,7 +95,7 @@ package.loaded.cassandra = {
       execute = function(_, query)
         assert(scenario == 'background_move')
         if query:find('system.local', 1, true) then
-          return { { rpc_address = '10.0.1.1', data_center = 'dc1' } }
+          return { { rpc_address = '10.0.1.1', data_center = 'dc1', rack = 'rack-new' } }
         end
         return discovered_peers
       end,
@@ -554,6 +554,7 @@ do
   local seen = {}
   for _, peer in ipairs(refreshed) do seen[peer.host] = true end
   assert(seen['10.0.1.1'] and not seen['10.0.0.1'])
+  assert(cluster:get_peer('10.0.1.1').rack == 'rack-new')
   local resolved = false
   for _, host in ipairs(connections) do if host == aliases[1] then resolved = true end end
   assert(resolved, 'discovery must connect through configured DNS aliases')
@@ -609,5 +610,18 @@ do
   ngx.timer = { at = function() error('maintenance must not schedule discovery') end }
   assert(cluster:set_peer_maintenance('stopping', true) == nil)
   ngx.timer = nil
+end
+-- Merge regression: marking a node DOWN/UP must preserve master's rack data.
+do
+  local cluster = new_cluster()
+  scenario = 'closed'
+  assert(cluster:set_peer('stopping', true, 0, 0, 'dc1', nil, '5.0', 'rack-a'))
+  assert(cluster:execute('test', nil, nil, { keyspace = 'tenant' }))
+  local peer = assert(cluster:get_peer('stopping'))
+  assert(peer.up == false and peer.rack == 'rack-a' and peer.data_center == 'dc1')
+  assert(peer.release_version == '5.0' and peer.err == 'closed')
+  assert(cluster:set_peer_up('stopping'))
+  peer = assert(cluster:get_peer('stopping'))
+  assert(peer.up and peer.rack == 'rack-a' and peer.release_version == '5.0')
 end
 print('failover checks passed')

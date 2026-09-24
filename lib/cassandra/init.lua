@@ -274,29 +274,8 @@ end
 
 local function send_startup(self)
   local startup_req = requests.startup.new()
-  local res, err, cql_err_code
-
-  -- Try with initial protocol version
-  res, err, cql_err_code = self:send(startup_req)
-  if err and cql_err_code == cql.ERROR_PROTOCOL then
-    -- Parse the error message to get supported versions
-    local supported_versions = parse_supported_versions(err)
-    -- Adjust protocol version if necessary
-    if supported_versions[self.protocol_version - 1] then
-      self.protocol_version = self.protocol_version - 1
-      res, err = self:send(startup_req)
-    else
-      return nil, 'No supported protocol version available'
-    end
-  end
-
-  if not res then
-    return nil, err
-  end
-
-  return res
+  return self:send(startup_req)
 end
-
 
 local function send_auth(self)
   local token = self.auth:initial_response()
