@@ -72,7 +72,7 @@ package.loaded['cassandra.cql'] = {
 }
 
 local expected_keyspace, closed, pooled, attempts, preparations, scenario
-local discovered_peers
+local discovered_peers, discovered_local
 package.loaded.cassandra = {
   get_request_opts = function(opts) return opts or {} end,
   new = function(opts)
@@ -95,7 +95,7 @@ package.loaded.cassandra = {
       execute = function(_, query)
         assert(scenario == 'background_move')
         if query:find('system.local', 1, true) then
-          return { { rpc_address = '10.0.1.1', data_center = 'dc1', rack = 'rack-new' } }
+          return { discovered_local or { rpc_address = '10.0.1.1', data_center = 'dc1', rack = 'rack-new' } }
         end
         return discovered_peers
       end,
@@ -166,6 +166,7 @@ local function new_cluster()
   closed, pooled, attempts, preparations, locks = {}, {}, {}, {}, {}
   reads, fault = 0, nil
   clock, expirations, flags = 1, {}, {}
+  discovered_local = nil
   unlock_failure, unlocks, connections, prepare_queries = false, 0, {}, {}
   local cluster = assert(Cluster.new { keyspace = 'default', silent = false })
   cluster.topo_ver = 1
@@ -624,4 +625,224 @@ do
   peer = assert(cluster:get_peer('stopping'))
   assert(peer.up and peer.rack == 'rack-a' and peer.release_version == '5.0')
 end
+-- Request-affine policies must isolate cursors and ngx.ctx across interleaved
+-- requests and discard sticky coordinators removed by topology refresh.
+for _, name in ipairs({ 'req_dc_rr', 'req_dc_rack_rr' }) do
+  local phase = 'init'
+  ngx.get_phase = function() return phase end
+  ngx.ctx = nil
+  local policy = require('resty.cassandra.policies.lb.' .. name).new('dc1', 'rack1')
+  local peers = {
+    { host = 'a', data_center = 'dc1', rack = 'rack1' },
+    { host = 'b', data_center = 'dc1', rack = 'rack1' },
+    { host = 'c', data_center = 'dc1', rack = 'rack2' },
+    { host = 'remote', data_center = 'dc2', rack = 'rack1' },
+  }
+  policy:init(peers)
+  for _ in policy:iter() do end
+  phase = 'content'
+  local a, b = {}, {}
+  ngx.ctx = a
+  local step, state, index = policy:iter()
+  local first
+  index, first = step(state, index)
+  local seen = { [first.host] = true }
+  ngx.ctx = b
+  for _ in policy:iter() do end
+  local b_host = b.cassandra_coordinator
+  ngx.ctx = a
+  while true do
+    local peer
+    index, peer = step(state, index)
+    if not index then break end
+    assert(not seen[peer.host], 'interleaved iterator repeated a host')
+    seen[peer.host] = true
+  end
+  assert(seen.a and seen.b and seen.c and seen.remote)
+  assert(b.cassandra_coordinator == b_host, 'iterator wrote into another request context')
+  local cached = a.cassandra_coordinator
+  step, state, index = policy:iter()
+  local _, sticky = step(state, index)
+  assert(sticky == cached)
+  -- A refreshed record for the same host replaces the old sticky record.
+  local replacement = { host = cached.host, data_center = 'dc1', rack = 'rack1' }
+  policy:init({ replacement })
+  step, state, index = policy:iter()
+  index, sticky = step(state, index)
+  assert(sticky == replacement and step(state, index) == nil)
+  policy:init({ peers[4] })
+  step, state, index = policy:iter()
+  index, sticky = step(state, index)
+  assert(sticky.host == 'remote' and step(state, index) == nil)
+  ngx.ctx = nil
+  policy:init({})
+  step, state, index = policy:iter()
+  assert(step(state, index) == nil)
+end
+
+-- Discovery must update metadata without resetting any existing health state,
+-- including when addresses stay identical. Other workers adopt that version.
+for _, change in ipairs({ 'rack', 'data_center', 'release_version', 'membership', 'unchanged', 'corrupt' }) do
+  local cluster = new_cluster()
+  scenario = 'background_move'
+  local local_host, down_host = '10.0.1.1', '10.0.1.2'
+  discovered_local = { rpc_address = local_host, data_center = 'dc1', rack = 'rack1', release_version = '5.0' }
+  discovered_peers = { { peer = down_host, rpc_address = down_host, data_center = 'dc1', rack = 'rack2', release_version = '5.0' } }
+  assert(cluster:set_peer(local_host, true, 0, 0, 'dc1', nil, '5.0', 'rack1'))
+  assert(cluster:set_peer(down_host, false, 60000, 1000, 'dc1', 'closed', '5.0', 'rack2'))
+  assert(cluster:set_peers(1, { { host = local_host }, { host = down_host } }, 4))
+  shm:set('topo:latest', 1, 0, 1)
+  cluster.lb_policy = require('resty.cassandra.policies.lb.req_dc_rack_rr').new('dc1', 'rack2')
+  cluster.lb_policy:init(assert(cluster:get_peers(1)))
+  cluster.contact_points = { 'cassandra-1.lotusflare.svc.cluster.local' }
+  cluster.refresh = Cluster.refresh
+  if change == 'membership' then
+    discovered_peers[2] = { peer = '10.0.1.3', rpc_address = '10.0.1.3', data_center = 'dc1', rack = 'rack3' }
+  elseif change ~= 'unchanged' and change ~= 'corrupt' then
+    discovered_local[change] = 'changed'
+  elseif change == 'corrupt' then
+    -- Fail only the health read during the metadata write, after comparison.
+    discovered_local.rack = 'changed'
+    local original = shm.get
+    local reads_of_record = 0
+    shm.get = function(self, key)
+      if key == 'host:rec:' .. down_host then
+        reads_of_record = reads_of_record + 1
+        if reads_of_record == 2 then return false end
+      end
+      return original(self, key)
+    end
+    local ok, err = cluster:refresh()
+    shm.get = original
+    assert(not ok and err == 'corrupted shm' and next(locks) == nil)
+  end
+  if change ~= 'corrupt' then
+    local ok, err, delta = cluster:refresh()
+    assert(ok, err)
+    local down = assert(cluster:get_peer(down_host))
+    assert(not down.up and down.reconn_delay == 60000 and down.unhealthy_at == 1000 and down.err == 'closed')
+    assert(cluster:can_try_peer(down_host) == false)
+    local record = assert(cluster:get_peer(local_host))
+    if change == 'unchanged' then
+      assert(cluster.topo_ver == 1)
+    else
+      assert(cluster.topo_ver == 2)
+      if change ~= 'membership' then
+        assert(record[change] == 'changed' and #delta.added == 0 and #delta.removed == 0)
+        assert(cluster.lb_policy.peers_by_host[local_host][change] == 'changed')
+      end
+      local other = assert(Cluster.new { silent = true })
+      other.topo_ver = 1
+      assert(other:refresh())
+      assert(other.topo_ver == 2)
+    end
+    assert(next(locks) == nil)
+  end
+end
+-- Exercise real v5 encoding/decoding and cluster retries; only transport is fake.
+local bit = require 'bit'
+ngx.crc32_long = function(bytes)
+  local crc = -1
+  for i = 1, #bytes do
+    crc = bit.bxor(crc, bytes:byte(i))
+    for _ = 1, 8 do
+      crc = bit.bxor(bit.rshift(crc, 1), bit.band(crc, 1) == 1 and 0xEDB88320 or 0)
+    end
+  end
+  return bit.bnot(crc)
+end
+assert(bit.tohex(ngx.crc32_long('123456789')) == 'cbf43926')
+package.loaded['cassandra.cql'] = nil
+local cql = require 'cassandra.cql'
+local function response(version, opcode, body, legacy)
+  local envelope = cql.buffer.new(version)
+  envelope:write_byte(0x80 + version)
+  envelope:write_byte(0)
+  envelope:write_short(0)
+  envelope:write_byte(opcode)
+  envelope:write_int(#body)
+  envelope:write(body)
+  local payload = envelope:get()
+  if legacy then return payload end
+  local frame = cql.buffer.new(version)
+  frame:write_24bits_le(#payload + 2^17)
+  frame:write_24bits_le(cql.crc24(frame:get()))
+  frame:write(payload)
+  frame:write_int_le(cql.crc32(payload))
+  return frame:get()
+end
+local downgrade, startup_versions, wire_attempts
+package.loaded['cassandra.socket'] = { tcp = function()
+  return {
+    connect = function(self, host) self.host = host; return true end,
+    getreusedtimes = function() return 0 end,
+    settimeout = function() return true end,
+    close = function(self) closed[self.host] = true; return true end,
+    setkeepalive = function(self) pooled[self.host] = true; return true end,
+    send = function(self, bytes)
+      if not self.started then
+        local version = bytes:byte(1)
+        assert(bytes:byte(5) == cql.OP_CODES.STARTUP)
+        startup_versions[#startup_versions + 1] = version
+        if downgrade and version == 5 then
+          local body = cql.buffer.new(version)
+          body:write_int(cql.errors.PROTOCOL)
+          body:write_string('Invalid or unsupported protocol version')
+          self.pending = response(version, cql.OP_CODES.ERROR, body:get(), true)
+        else
+          self.pending = response(version, cql.OP_CODES.READY, '', true)
+        end
+        self.started = true
+      else
+        wire_attempts[#wire_attempts + 1] = { host = self.host, bytes = bytes }
+        if self.host == 'stopping' then return nil, 'closed' end
+        self.pending = response(5, cql.OP_CODES.RESULT, '\0\0\0\1')
+      end
+      return #bytes
+    end,
+    receive = function(self, n)
+      assert(self.pending and #self.pending >= n)
+      local bytes = self.pending:sub(1, n)
+      self.pending = self.pending:sub(n + 1)
+      return bytes
+    end,
+  }
+end }
+package.loaded.cassandra = nil
+package.loaded['resty.cassandra.cluster'] = nil
+Cluster = require 'resty.cassandra.cluster'
+for _, operation in ipairs({ 'query', 'prepared', 'batch', 'fragmented' }) do
+  local cluster = new_cluster()
+  startup_versions, wire_attempts = {}, {}
+  local query = operation == 'fragmented' and string.rep('x', 140000) or 'SELECT * FROM items'
+  cluster.prepared_ids[query] = { query_id = 'query-id', result_metadata_id = 'metadata-id' }
+  local result, err
+  if operation == 'batch' then
+    result, err = cluster:batch({ { query } }, nil, { no_keyspace = true })
+  else
+    result, err = cluster:execute(query, nil, { prepared = operation == 'prepared' }, { no_keyspace = true })
+  end
+  assert(result and result.type == 'VOID', err)
+  assert(#wire_attempts == 2 and wire_attempts[1].host == 'stopping' and wire_attempts[2].host == 'healthy')
+  assert(wire_attempts[1].bytes == wire_attempts[2].bytes, 'retry changed encoded request')
+  assert(startup_versions[1] == 5 and startup_versions[2] == 5)
+  assert(data.stopping == false and closed.stopping and pooled.healthy)
+  local bytes, offset, fragments = wire_attempts[2].bytes, 1, 0
+  repeat
+    local frame = cql.buffer.new(5, bytes:sub(offset))
+    local header = frame:read_24bits_le()
+    local length = bit.band(header, 0x1FFFF)
+    assert(bit.rshift(header, 17) == (operation == 'fragmented' and 0 or 1))
+    assert(frame:read_24bits_le() == cql.crc24(bytes:sub(offset, offset + 2)))
+    local payload = frame:read(length)
+    assert(frame:read_int_le() == cql.crc32(payload))
+    offset, fragments = offset + length + 10, fragments + 1
+  until offset > #bytes
+  assert(offset == #bytes + 1 and fragments == (operation == 'fragmented' and 2 or 1))
+end
+downgrade, startup_versions = true, {}
+local host = assert(require('cassandra').new { host = 'healthy' })
+assert(host:connect())
+assert(host.protocol_version == 4 and #startup_versions == 2)
+assert(startup_versions[1] == 5 and startup_versions[2] == 4)
 print('failover checks passed')

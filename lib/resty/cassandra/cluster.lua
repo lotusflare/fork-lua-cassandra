@@ -669,11 +669,16 @@ local function next_coordinator_with_refresh(self, coordinator_options, request)
 end
 
 local function compare_peers(t1, t2, tc)
+  local metadata_changed = false
   for i = 1, #t1 do
     local found
 
     for j = 1, #t2 do
       if t1[i].host == t2[j].host then
+        if t1[i].data_center ~= t2[j].data_center or t1[i].rack ~= t2[j].rack or
+           t1[i].release_version ~= t2[j].release_version then
+          metadata_changed = true
+        end
         found = true
         break
       end
@@ -683,6 +688,7 @@ local function compare_peers(t1, t2, tc)
       table.insert(tc, t1[i].host)
     end
   end
+  return metadata_changed
 end
 
 local function err_with_unlock(lock, err, ...)
@@ -825,6 +831,7 @@ function _Cluster:refresh(timeout)
         removed = {},
       }
 
+      local metadata_changed
       if ver_refresh == 1 then
         for i = 1, #rows do
           table.insert(topo_changes.added, rows[i].host)
@@ -836,12 +843,12 @@ function _Cluster:refresh(timeout)
           log(ERR, _log_prefix, 'refresh: missing peers entry when comparing ',
                     'topologies (ver_refresh=', ver_refresh, ')')
         else
-          compare_peers(rows, old_peers, topo_changes.added)
+          metadata_changed = compare_peers(rows, old_peers, topo_changes.added)
           compare_peers(old_peers, rows, topo_changes.removed)
         end
       end
 
-      local rebuild = #topo_changes.added > 0 or #topo_changes.removed > 0
+      local rebuild = metadata_changed or #topo_changes.added > 0 or #topo_changes.removed > 0
 
       log(ERR, _log_prefix, 'refresh: changes detected in topology: ',
                  rebuild and 'yes' or 'no', ' (ver_refresh=', ver_refresh, ')')
@@ -855,8 +862,18 @@ function _Cluster:refresh(timeout)
                                   ' in ', coordinator.host, '\'s peers system ',
                                   'table. ', rows[i].peer, ' will be ignored.')
           else
-            local ok, err = set_peer(self, rows[i].host, true, 0, 0,
-                                     rows[i].data_center, nil,
+            -- Discovery proves membership, not health. Preserve existing
+            -- DOWN state, reconnection backoff and the recorded failure.
+            local up = self.shm:get(rows[i].host)
+            local state = empty_t
+            if up ~= nil then
+              local err
+              state, err = get_peer(self, rows[i].host, up)
+              if not state then return err_with_unlock(lock, err) end
+            end
+            local ok, err = set_peer(self, rows[i].host, up == nil or up,
+                                     state.reconn_delay or 0, state.unhealthy_at or 0,
+                                     rows[i].data_center, state.err,
                                      rows[i].release_version, rows[i].rack)
             if not ok then return err_with_unlock(lock, err) end
           end
