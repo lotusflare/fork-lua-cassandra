@@ -35,9 +35,12 @@ local function next_peer(state, i)
 end
 
 function _rr_lb:iter()
-  self.idx = (self.start_idx % #self.peers) + 1
+  local state = {
+    peers = self.peers,
+    idx = #self.peers > 0 and (self.start_idx % #self.peers) + 1 or 0,
+  }
   self.start_idx = self.start_idx + 1
-  return next_peer, self, 0
+  return next_peer, state, 0
 end
 
 return _rr_lb

@@ -217,7 +217,7 @@ qq{
             return 'retried'
         end
         Cluster.coordinator_fixture = {
-            setkeepalive = function()end,
+            close = function()end,
             host = '127.0.0.1'
         }
     }
