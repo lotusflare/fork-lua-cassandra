@@ -74,16 +74,19 @@ local function next_peer(state, i)
 end
 
 function _M:iter()
-  self.local_tried = 0
-  self.remote_tried = 0
-
-  self.local_idx = (self.start_local_idx % #self.local_peers) + 1
-  self.remote_idx = (self.start_remote_idx % #self.remote_peers) + 1
+  local state = {
+    local_peers = self.local_peers,
+    remote_peers = self.remote_peers,
+    local_tried = 0,
+    remote_tried = 0,
+    local_idx = #self.local_peers > 0 and (self.start_local_idx % #self.local_peers) + 1 or 0,
+    remote_idx = #self.remote_peers > 0 and (self.start_remote_idx % #self.remote_peers) + 1 or 0,
+  }
 
   self.start_remote_idx = self.start_remote_idx + 1
   self.start_local_idx = self.start_local_idx + 1
 
-  return next_peer, self, 0
+  return next_peer, state, 0
 end
 
 return _M

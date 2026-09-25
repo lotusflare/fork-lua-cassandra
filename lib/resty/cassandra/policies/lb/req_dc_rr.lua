@@ -45,8 +45,10 @@ end
 
 function _M:init(peers)
   local local_peers, remote_peers = {}, {}
+  self.peers_by_host = {}
 
   for i = 1, #peers do
+    self.peers_by_host[peers[i].host] = peers[i]
     if type(peers[i].data_center) ~= 'string' then
       ngx.log(ngx.WARN, cluster._log_prefix, 'peer ', peers[i].host,
               ' has no data_center field in shm, considering it remote')
@@ -112,25 +114,26 @@ local function next_peer(state, i)
 end
 
 function _M:iter()
-  self.local_tried = 0
-  self.remote_tried = 0
-
+  local ctx
   if past_init or ngx.get_phase() ~= "init" then
-    self.ctx = ngx and ngx.ctx
+    ctx = ngx.ctx
     past_init = true
   end
 
-  if self.ctx then
-    self.initial_cassandra_coordinator = self.ctx.cassandra_coordinator
-  end
-
-  self.local_idx = (self.start_local_idx % #self.local_peers) + 1
-  self.remote_idx = (self.start_remote_idx % #self.remote_peers) + 1
+  local cached = ctx and ctx.cassandra_coordinator
+  local state = {
+    ctx = ctx,
+    initial_cassandra_coordinator = cached and self.peers_by_host[cached.host],
+    local_peers = self.local_peers, remote_peers = self.remote_peers,
+    local_tried = 0, remote_tried = 0,
+    local_idx = #self.local_peers > 0 and (self.start_local_idx % #self.local_peers) + 1 or 0,
+    remote_idx = #self.remote_peers > 0 and (self.start_remote_idx % #self.remote_peers) + 1 or 0,
+  }
 
   self.start_remote_idx = self.start_remote_idx + 1
   self.start_local_idx = self.start_local_idx + 1
 
-  return next_peer, self, 0
+  return next_peer, state, 0
 end
 
 return _M

@@ -43,9 +43,11 @@ end
 
 function _M:init(peers)
   local same_rack, local_other_rack, remote = {}, {}, {}
+  self.peers_by_host = {}
 
   for i = 1, #peers do
     local peer = peers[i]
+    self.peers_by_host[peer.host] = peer
     if type(peer.data_center) ~= 'string' then
       ngx.log(ngx.WARN, cluster._log_prefix, 'peer ', peer.host,
               ' has no data_center field in shm, considering it remote')
@@ -123,34 +125,29 @@ local function next_peer(state, i)
 end
 
 function _M:iter()
-  self.same_tried = 0
-  self.local_other_tried = 0
-  self.remote_tried = 0
-
+  local ctx
   if past_init or ngx.get_phase() ~= "init" then
-    self.ctx = ngx and ngx.ctx
+    ctx = ngx.ctx
     past_init = true
   end
-
-  if self.ctx then
-    self.initial_cassandra_coordinator = self.ctx.cassandra_coordinator
-  end
-
-  if #self.same_rack_peers > 0 then
-    self.same_idx = (self.start_same_idx % #self.same_rack_peers) + 1
-  end
-  if #self.local_other_rack_peers > 0 then
-    self.local_other_idx = (self.start_local_other_idx % #self.local_other_rack_peers) + 1
-  end
-  if #self.remote_peers > 0 then
-    self.remote_idx = (self.start_remote_idx % #self.remote_peers) + 1
-  end
+  local cached = ctx and ctx.cassandra_coordinator
+  local state = {
+    ctx = ctx,
+    initial_cassandra_coordinator = cached and self.peers_by_host[cached.host],
+    same_rack_peers = self.same_rack_peers,
+    local_other_rack_peers = self.local_other_rack_peers,
+    remote_peers = self.remote_peers,
+    same_tried = 0, local_other_tried = 0, remote_tried = 0,
+    same_idx = #self.same_rack_peers > 0 and (self.start_same_idx % #self.same_rack_peers) + 1 or 0,
+    local_other_idx = #self.local_other_rack_peers > 0 and (self.start_local_other_idx % #self.local_other_rack_peers) + 1 or 0,
+    remote_idx = #self.remote_peers > 0 and (self.start_remote_idx % #self.remote_peers) + 1 or 0,
+  }
 
   self.start_same_idx = self.start_same_idx + 1
   self.start_local_other_idx = self.start_local_other_idx + 1
   self.start_remote_idx = self.start_remote_idx + 1
 
-  return next_peer, self, 0
+  return next_peer, state, 0
 end
 
 return _M
