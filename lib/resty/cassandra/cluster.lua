@@ -16,6 +16,7 @@ local concat = table.concat
 local shared = ngx.shared
 local assert = assert
 local pairs = pairs
+local next = next
 local fmt = string.format
 local sub = string.sub
 local find = string.find
@@ -35,6 +36,10 @@ local _prepared_key = 'prepared:id:'
 local _topo_version_key = 'topo:'
 local _refresh_lock_key = 'refresh:'
 local _background_refresh_key = 'refresh:background'
+-- Prefix marking a self-describing peer record. Legacy records start with a
+-- digit (reconn_delay), so this sentinel unambiguously identifies the current
+-- rack-aware layout and avoids the old-vs-new colon-counting heuristic below.
+local _rec_prefix = '@2:'
 
 local function get_now()
   return now() * 1000
@@ -65,7 +70,8 @@ local function set_peer(self, host, up, reconn_delay, unhealthy_at,
   end
 
   -- host info
-  local marshalled = fmt("%d:%d:%d:%d:%d:%s%s%s%s", reconn_delay, unhealthy_at,
+  local marshalled = fmt("%s%d:%d:%d:%d:%d:%s%s%s%s", _rec_prefix,
+                         reconn_delay, unhealthy_at,
                          #data_center, #connect_err, #rack,
                          data_center, connect_err, rack, release_version)
 
@@ -83,7 +89,7 @@ local function add_peer(self, host, up, reconn_delay, unhealthy_at,
                   release_version, rack, true)
 end
 
-local function get_peer(self, host, status)
+local function get_peer(self, host, status, no_wait)
   local timeout = 1000
 
   update_time()
@@ -92,6 +98,10 @@ local function get_peer(self, host, status)
   if err then
     return nil, 'could not get host details in shm: '..err
   elseif marshalled == nil then
+    -- The status key can outlive an evicted detail record; no_wait callers
+    -- (e.g. refresh, which holds the topology lock) must not spin waiting for
+    -- a record that is gone. Report the absence so they can treat it as fresh.
+    if no_wait then return nil, 'no host details for '..host, true end
     local tdiff
     repeat
       update_time()
@@ -110,21 +120,28 @@ local function get_peer(self, host, status)
     if err then return nil, 'could not get host status in shm: '..err end
   end
 
-  local sep_1 = find(marshalled, ":", 1, true)
+  local tagged = sub(marshalled, 1, #_rec_prefix) == _rec_prefix
+  local offset = tagged and #_rec_prefix or 0
+
+  local sep_1 = find(marshalled, ":", offset + 1, true)
   local sep_2 = find(marshalled, ":", sep_1 + 1, true)
   local sep_3 = find(marshalled, ":", sep_2 + 1, true)
   local sep_4 = find(marshalled, ":", sep_3 + 1, true)
   local sep_5 = find(marshalled, ":", sep_4 + 1, true)
 
-  local reconn_delay    = sub(marshalled, 1, sep_1 - 1)
+  local reconn_delay    = sub(marshalled, offset + 1, sep_1 - 1)
   local unhealthy_at    = sub(marshalled, sep_1 + 1, sep_2 - 1)
   local data_center_len = sub(marshalled, sep_2 + 1, sep_3 - 1)
   local err_len         = sub(marshalled, sep_3 + 1, sep_4 - 1)
 
   local data_center, err_conn, rack, release_version
 
-  if sep_5 and tonumber(sub(marshalled, sep_4 + 1, sep_5 - 1)) then
-    -- new format: reconn:unhealthy:dc_len:err_len:rack_len:dc+err+rack+ver
+  -- Tagged records are unambiguously the rack-aware layout. For legacy
+  -- untagged records we still guess via the 5th colon, which can misfire when
+  -- free-text fields contain ':' -- unavoidable for pre-upgrade records, and
+  -- resolved once each host is rediscovered and rewritten with the prefix.
+  if tagged or (sep_5 and tonumber(sub(marshalled, sep_4 + 1, sep_5 - 1))) then
+    -- rack format: reconn:unhealthy:dc_len:err_len:rack_len:dc+err+rack+ver
     local rack_len = tonumber(sub(marshalled, sep_4 + 1, sep_5 - 1))
     local data_center_last = sep_5 + tonumber(data_center_len)
     local err_last = data_center_last + tonumber(err_len)
@@ -634,7 +651,13 @@ local function next_coordinator_with_refresh(self, coordinator_options, request)
     return coordinator
   end
 
-  if not refreshable or request.topology_refreshed or request.last_cql_code then
+  -- A CQL response proves the contacted nodes are reachable, so a stale-DNS
+  -- refresh is pointless -- but only when nothing failed at the transport
+  -- level. A connection-level failure (recorded in failed_hosts, whether at
+  -- selection or in handle_error) can indicate a replaced/re-addressed node
+  -- even if a later host happened to answer with a CQL error, so honor it.
+  if not refreshable or request.topology_refreshed or
+     (request.last_cql_code and next(request.failed_hosts) == nil) then
     return nil, err, refreshable
   end
 
@@ -864,12 +887,18 @@ function _Cluster:refresh(timeout)
           else
             -- Discovery proves membership, not health. Preserve existing
             -- DOWN state, reconnection backoff and the recorded failure.
-            local up = self.shm:get(rows[i].host)
+            local up, err = self.shm:get(rows[i].host)
+            if err then return err_with_unlock(lock, 'could not get host status in shm: '..err) end
             local state = empty_t
             if up ~= nil then
-              local err
-              state, err = get_peer(self, rows[i].host, up)
-              if not state then return err_with_unlock(lock, err) end
+              -- no_wait: a missing detail record here means it was evicted
+              -- while the status key survived; do not spin holding this lock.
+              local peer_state, get_err, missing = get_peer(self, rows[i].host, up, true)
+              if peer_state then
+                state = peer_state
+              elseif not missing then
+                return err_with_unlock(lock, get_err)
+              end
             end
             local ok, err = set_peer(self, rows[i].host, up == nil or up,
                                      state.reconn_delay or 0, state.unhealthy_at or 0,

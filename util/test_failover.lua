@@ -134,6 +134,10 @@ package.loaded.cassandra = {
           if host == 'stopping' then return nil, 'closed' end
           return nil, 'read timeout', errors.READ_TIMEOUT
         end
+        if scenario == 'closed_then_overloaded' then
+          if host == 'stopping' then return nil, 'closed' end
+          return nil, 'overloaded', errors.OVERLOADED
+        end
         if scenario == 'all_closed' or scenario == 'initial_refresh_closed' or
            (scenario == 'stale' and host ~= 'replacement') then
           return nil, 'closed'
@@ -231,6 +235,24 @@ for _, mode in ipairs({ 'overloaded', 'timeout', 'always_unprepared', 'invalid' 
     assert(table.concat(attempts, ',') == 'stopping,healthy', 'each host must be tried once')
   end
   assert(refreshes == 0, 'reachable hosts must not trigger topology refresh')
+  assert(next(locks) == nil)
+end
+
+-- A connection-level failure still warrants a stale-DNS refresh even when a
+-- later host answers with a CQL error: the CQL code of the last failure must
+-- not mask an earlier transport failure recorded in failed_hosts.
+do
+  scenario = 'closed_then_overloaded'
+  local cluster = new_cluster()
+  local refreshes = 0
+  cluster.refresh = function()
+    refreshes = refreshes + 1
+    assert(refreshes == 1, 'more than one recovery refresh')
+    return true
+  end
+  local result, err = cluster:execute('SELECT * FROM items', nil, nil, { keyspace = 'tenant' })
+  assert(not result and err)
+  assert(refreshes == 1, 'transport failure must trigger refresh despite a later CQL error')
   assert(next(locks) == nil)
 end
 
@@ -625,6 +647,29 @@ do
   peer = assert(cluster:get_peer('stopping'))
   assert(peer.up and peer.rack == 'rack-a' and peer.release_version == '5.0')
 end
+-- The self-describing prefix makes the current layout parse deterministically:
+-- a colon inside connect_err with a numeric data_center (which used to fool the
+-- old-vs-new heuristic) now round-trips exactly regardless of field contents.
+do
+  local cluster = new_cluster()
+  assert(cluster:set_peer('stopping', false, 1000, 123456, '10', '5:9042 refused', '3.11.4', 'rack-x'))
+  assert(data['host:rec:stopping']:find('@2:', 1, true) == 1, 'record must carry the version prefix')
+  local peer = assert(cluster:get_peer('stopping', false))
+  assert(peer.data_center == '10' and peer.err == '5:9042 refused')
+  assert(peer.release_version == '3.11.4' and peer.rack == 'rack-x')
+  assert(peer.reconn_delay == 1000 and peer.unhealthy_at == 123456)
+end
+-- Legacy untagged records (pre-rack, four header fields) must still parse as
+-- the old format so a rolling upgrade keeps reading pre-existing shm entries.
+do
+  local cluster = new_cluster()
+  data['host:rec:legacy'] = '1000:2000:3:6:dc1closed3.11.4'
+  data.legacy = true
+  local peer = assert(cluster:get_peer('legacy'))
+  assert(peer.data_center == 'dc1' and peer.err == 'closed' and peer.rack == nil)
+  assert(peer.release_version == '3.11.4')
+  assert(peer.reconn_delay == 1000 and peer.unhealthy_at == 2000)
+end
 -- Request-affine policies must isolate cursors and ngx.ctx across interleaved
 -- requests and discard sticky coordinators removed by topology refresh.
 for _, name in ipairs({ 'req_dc_rr', 'req_dc_rack_rr' }) do
@@ -682,7 +727,7 @@ end
 
 -- Discovery must update metadata without resetting any existing health state,
 -- including when addresses stay identical. Other workers adopt that version.
-for _, change in ipairs({ 'rack', 'data_center', 'release_version', 'membership', 'unchanged', 'corrupt' }) do
+for _, change in ipairs({ 'rack', 'data_center', 'release_version', 'membership', 'unchanged', 'corrupt', 'evicted' }) do
   local cluster = new_cluster()
   scenario = 'background_move'
   local local_host, down_host = '10.0.1.1', '10.0.1.2'
@@ -698,8 +743,34 @@ for _, change in ipairs({ 'rack', 'data_center', 'release_version', 'membership'
   cluster.refresh = Cluster.refresh
   if change == 'membership' then
     discovered_peers[2] = { peer = '10.0.1.3', rpc_address = '10.0.1.3', data_center = 'dc1', rack = 'rack3' }
-  elseif change ~= 'unchanged' and change ~= 'corrupt' then
+  elseif change ~= 'unchanged' and change ~= 'corrupt' and change ~= 'evicted' then
     discovered_local[change] = 'changed'
+  elseif change == 'evicted' then
+    -- The detail record is evicted (returns nil) while the status key survives:
+    -- refresh must proceed without busy-waiting on the missing record.
+    discovered_local.rack = 'changed'
+    local original = shm.get
+    local reads_of_record = 0
+    shm.get = function(self, key)
+      if key == 'host:rec:' .. down_host then
+        reads_of_record = reads_of_record + 1
+        -- Evict the record only on the rebuild-phase health read (#2), as in
+        -- the 'corrupt' case. A busy-wait here would spin forever (static clock).
+        if reads_of_record == 2 then return nil end
+      end
+      return original(self, key)
+    end
+    local ok, err = cluster:refresh()
+    shm.get = original
+    assert(ok, err)
+    assert(reads_of_record > 0, 'the evicted record was not read')
+    -- The DOWN status flag is preserved, but the lost backoff/error detail
+    -- resets to defaults: no_wait treats the evicted read as missing rather
+    -- than spinning to re-read it (which would otherwise recover the old
+    -- backoff of 60000/1000 and hang under a real, non-advancing eviction).
+    local peer = assert(cluster:get_peer(down_host))
+    assert(not peer.up and peer.reconn_delay == 0 and peer.unhealthy_at == 0 and peer.err == '')
+    assert(next(locks) == nil)
   elseif change == 'corrupt' then
     -- Fail only the health read during the metadata write, after comparison.
     discovered_local.rack = 'changed'
@@ -716,7 +787,7 @@ for _, change in ipairs({ 'rack', 'data_center', 'release_version', 'membership'
     shm.get = original
     assert(not ok and err == 'corrupted shm' and next(locks) == nil)
   end
-  if change ~= 'corrupt' then
+  if change ~= 'corrupt' and change ~= 'evicted' then
     local ok, err, delta = cluster:refresh()
     assert(ok, err)
     local down = assert(cluster:get_peer(down_host))
